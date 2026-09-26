@@ -35,6 +35,7 @@ import {
     MAX_ACTIVE_ATTACK_SIEGES,
     SECTOR_RESIEGE_COOLDOWN_SEC,
     abandonSectorWar,
+    sectorWarInstanceTag,
     type SectorWarDeclineReason,
     type SectorWarSession,
 } from '../_sector-war.js';
@@ -77,6 +78,7 @@ import { hydrateCharacterFromSave, sealItemCharges } from '../pvp/session.js';
 import { loadAdminCombatContent } from '../_admin-content.js';
 import { augmentSaveWithForgedDefs } from '../_forged-item-registry.js';
 import { findTowerBattleStartConflict, towerBattleActiveErrorBody } from '../_tower-battle-guard.js';
+import { isIncapacitated } from '../_elapsed-state.js';
 import { villageHasActiveWar, seedHomeSectorOwnership } from '../world-state.js';
 import {
     WAR_DECLARATION_FUNDING_FIELD,
@@ -100,6 +102,8 @@ import { settleDueSectorWars } from '../_sector-war-settle.js';
 import { intelDeclareCost, sectorIntelFor, type IntelTier } from '../_village-intel.js';
 import { SECTOR_WAR_WR } from '../_war-economy.js';
 import { recordWarEcoEvent } from '../_war-telemetry.js';
+import { logWarEvent } from '../_war-event-log.js';
+import { recordAudit } from '../_audit.js';
 import { announce, postVillageHerald } from '../_announce.js';
 import { pvpSessionMayGrantProgress, type PvpSession } from '../pvp/session.js';
 import { loadPvpRewardRecoverySnapshot } from '../pvp/_reward-recovery.js';
@@ -403,11 +407,13 @@ async function continueSectorDeclaration(context: SectorFundingContext): Promise
             if (ownerNow !== session.defenderVillage) {
                 return abortChangedSectorAuthority(context, authorityNow);
             }
-            const dueOnSector = (await listUnsettledDueSectorWars(authorityNow))
+            // Strict scans: an unreadable contest row blocks the declaration
+            // rather than vanishing from it (see SectorWarScanOptions).
+            const dueOnSector = (await listUnsettledDueSectorWars(authorityNow, kv, { strict: true }))
                 .some(candidate => candidate.sector === session.sector);
             if (dueOnSector) return abortChangedSectorAuthority(context, authorityNow);
 
-            const live = await activeContestOnSector(session.sector, authorityNow);
+            const live = await activeContestOnSector(session.sector, authorityNow, { strict: true });
             if (live) {
                 const marker = warDeclarationFundingMarkerFromRow(live);
                 if (live.id === session.id
@@ -501,6 +507,18 @@ async function sendSectorFundingOutcome(
     if (outcome.status !== 'active') {
         return res.status(503).json({ error: 'Sector-war funding is settling — try again.' });
     }
+    if (outcome.chargedNow) {
+        logWarEvent('contest-declared', {
+            contestId: outcome.session.id,
+            instance: sectorWarInstanceTag(outcome.session),
+            sector: outcome.session.sector,
+            attackerVillage: outcome.session.attackerVillage,
+            defenderVillage: outcome.session.defenderVillage,
+            winCondition: outcome.session.winCondition,
+            cost: outcome.cost,
+            endsAt: outcome.session.endsAt,
+        });
+    }
     if (outcome.cost > 0) {
         void recordWarEcoEvent({
             eventId: `declare:${session.id}:g${session.declarationGeneration}`,
@@ -556,7 +574,9 @@ async function sendSectorFundingOutcome(
  * administrator must inspect it." straight into a Kage's face.)
  */
 function declarationFault(res: VercelResponse, code: string, message: string, detail: Record<string, unknown>): VercelResponse {
-    console.warn('[village/sector-war] declaration-fault', safeLogValue({ code, ...detail }));
+    // Serialized first: safeLogValue stringifies, and an object printed as
+    // "[object Object]", which hid every one of these diagnostics.
+    console.warn('[village/sector-war] declaration-fault', safeLogValue(JSON.stringify({ code, ...detail }), 600));
     return res.status(503).json({ error: message, code });
 }
 
@@ -612,7 +632,7 @@ async function doDeclare(req: VercelRequest, res: VercelResponse, identity: Iden
     // sector+attacker, not by the current owner-derived contest id: ownership may
     // have changed while the original process was down, in which case recovery
     // must exact-abort/fence the old authority rather than strand it forever.
-    const pendingFunding = (await listFundingSectorWars())
+    const pendingFunding = (await listFundingSectorWars(kv, { strict: true }))
         .filter(candidate => candidate.sector === sector && candidate.attackerVillage === village);
     if (pendingFunding.length > 1) {
         return declarationFault(res, 'multiple-funding-rows',
@@ -671,10 +691,11 @@ async function doDeclare(req: VercelRequest, res: VercelResponse, identity: Iden
     const [attackerInWar, defenderInWar, existing, atkRecord, defRaw, mySieges] = await Promise.all([
         villageHasActiveWar(village),
         isWarVillage(defender) ? villageHasActiveWar(defender) : Promise.resolve(false),
-        activeContestOnSector(sector),
+        activeContestOnSector(sector, Date.now(), { strict: true }),
         kv.get<Record<string, unknown>>(atkKey),
         isWarVillage(defender) ? kv.get<Record<string, unknown>>(villageWarKey(defender)) : Promise.resolve(null),
-        activeSectorWarsForVillage(village).then((all) => all.filter((c) => c.attackerVillage === village).length),
+        activeSectorWarsForVillage(village, Date.now(), { strict: true })
+            .then((all) => all.filter((c) => c.attackerVillage === village).length),
     ]);
     // A lingering FAILED record (expired/abandoned, not a capture) for this exact
     // attacker+sector is the re-siege cooldown — its TTL is the clock.
@@ -778,6 +799,14 @@ async function doAttack(req: VercelRequest, res: VercelResponse, identity: Ident
     }
     if (!Number.isSafeInteger(battle.createdAt) || battle.createdAt < contest.startedAt) {
         return res.status(409).json({ error: 'That battle predates this sector war.' });
+    }
+    // The battle's sector is the one the server sealed at creation (both
+    // fighters were present there), never the body's. A token bound to another
+    // sector is refused by the terminal continuation, which used to leave both
+    // fighters unable to finish the battle, claim, or start another for the
+    // token's whole life. Not this sector's battle, so a no-op, like any other.
+    if (Math.floor(Number(battle.rewardSector)) !== sector) {
+        return res.status(200).json({ ok: true, registered: false, battleId, noContest: true, reason: 'other-sector' });
     }
     const p1 = safeName(battle.p1?.name ?? '');
     const p2 = safeName(battle.p2?.name ?? '');
@@ -1005,6 +1034,13 @@ async function doGarrisonStart(req: VercelRequest, res: VercelResponse, identity
             await kv.del(activeKey);
         }
 
+        // An assault already on the board resumes above; a NEW one is not
+        // sealed for a hospitalized attacker. It would seed them at the save's
+        // zero HP and spend the garrison window on a fight they cannot play.
+        if (!identity.admin && isIncapacitated(char)) {
+            return { status: 409 as const, body: { error: 'You are in the hospital. Recover before starting a fight.', errorCode: 'hospitalized' } };
+        }
+
         const anbuSlug = await pickAnbuDefender(contest.defenderVillage, appointees);
         const snapshot = anbuSlug ? await getOrSealAnbuSnapshot(contest.defenderVillage, anbuSlug) : null;
         if (!anbuSlug || !snapshot) {
@@ -1195,13 +1231,41 @@ async function doAbandon(req: VercelRequest, res: VercelResponse, identity: Iden
         const { session, changed } = abandonSectorWar(fresh, Date.now());
         // The stamped record carries the re-siege cooldown TTL. (It previously had
         // NO ttl here, so an abandoned siege lingered in the keyspace forever.)
-        if (!changed) return { ok: true as const, session };
+        if (!changed) return { ok: true as const, session, changed: false };
         const drained = await drainSectorWarLedger(session, Date.now(), kv, confirmed);
         await saveSectorWar(drained, SECTOR_RESIEGE_COOLDOWN_SEC);
-        return { ok: true as const, session: drained };
+        return { ok: true as const, session: drained, changed: true, before: fresh };
     }, { failClosed: true });
 
     if (!out.ok) return res.status(409).json({ error: 'That sector war is already over.' });
+    if (out.changed) {
+        // Calling a war off is the supported way to cancel one, so it leaves a
+        // trail: GET /api/admin/audit-log?domain=sector.
+        const instance = sectorWarInstanceTag(out.session);
+        logWarEvent('contest-abandoned', {
+            contestId: out.session.id,
+            instance,
+            sector: out.session.sector,
+            actor: identity.admin ? 'admin' : 'kage',
+            attackerPoints: out.session.attackerPoints,
+            defenderPoints: out.session.defenderPoints,
+        });
+        await recordAudit({
+            domain: 'sector',
+            action: 'sector-war.abandon',
+            actor: identity.admin ? 'admin' : playerName,
+            entityType: 'sector-war',
+            entityId: out.session.id,
+            receiptId: `sector-war-abandon:${out.session.id}:${instance}`,
+            before: {
+                attackerPoints: out.before?.attackerPoints,
+                defenderPoints: out.before?.defenderPoints,
+                endsAt: out.before?.endsAt,
+            },
+            after: { expiredReason: out.session.expiredReason, expiredAt: out.session.expiredAt },
+            meta: { sector: out.session.sector, attackerVillage: out.session.attackerVillage, defenderVillage: out.session.defenderVillage },
+        });
+    }
     // The WR spent declaring is NOT refunded — a called-off siege still cost the
     // village, which is what keeps declare-spam from being free.
     return res.status(200).json({ ok: true, sector, contest: projectSectorWarForClient(out.session) });
@@ -1276,9 +1340,11 @@ async function doGarrisonFeed(req: VercelRequest, res: VercelResponse, identity:
 
 // ── status (read-only) ─────────────────────────────────────────────────────────
 async function doStatus(_req: VercelRequest, res: VercelResponse, identity: Identity, playerName: string, body: Record<string, unknown>) {
-    // The war map polls this every 15s, which makes it the near-instant
-    // settlement path: a war whose 72 hours just closed flips (or holds) within
-    // one poll of someone looking at it. The daily pass is only the backstop.
+    // Settles every due war first. No client screen calls this action: the
+    // war map polls GET /api/village/war-map, which does not settle. A war
+    // whose 72 hours closed flips (or holds) on the next sector-war
+    // declaration, an explicit `status` call (the staffed-event runbook uses
+    // one), or the 03:00 UTC daily pass.
     await settleDueSectorWars();
     // The viewer's village drives the projection's compatibility `garrisonFed*`
     // mirror (their OWN per-village feed entry only).

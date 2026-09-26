@@ -15,6 +15,7 @@ import { validateServerAiRules } from '../combat-core/ai-authoring.js';
 import type { PvpFighter } from '../pvp/session.js';
 import { hydrateCharacterFromSave, sealItemCharges } from '../pvp/session.js';
 import { createSoloPveSession, type SoloPveEncounter, type SoloPveEnvironment, type SoloPveSession } from './_session.js';
+import { standardPveAiPlannerDisabled, type STANDARD_PVE_AI_POLICY } from './_ai-turn-policy.js';
 
 export type SoloPveAiProfile = Record<string, unknown> & { id: string };
 
@@ -103,7 +104,7 @@ function fighterFromHydratedCharacter(character: Record<string, unknown>, pos: n
     };
 }
 
-function buildEnemy(profile: SoloPveAiProfile, admin: AdminCombatContent | null, banded: boolean): PvpFighter {
+function buildEnemy(profile: SoloPveAiProfile, admin: AdminCombatContent | null, banded: boolean, aiTurnPolicy?: typeof STANDARD_PVE_AI_POLICY): PvpFighter {
     const level = integer(profile.level, 1, 100, 20);
     const rawStats = profile.stats && typeof profile.stats === 'object' ? profile.stats as Record<string, unknown> : {};
     const numericStats: Record<string, number> = {};
@@ -155,6 +156,9 @@ function buildEnemy(profile: SoloPveAiProfile, admin: AdminCombatContent | null,
         ...(aiProgram.rules.length > 0 ? { aiRules: aiProgram.rules } : {}),
         // Persist the policy choice; old sessions retain their original runner.
         ...(profile.missionTactics === true && aiProgram.rules.length > 0 ? { missionTactics: true } : {}),
+        // Same rule for the standard-PvE turn planner (./_ai-turn-policy.ts):
+        // sealed here, so a fight keeps the runner it started with.
+        ...(aiTurnPolicy ? { aiTurnPolicy } : {}),
     };
     return {
         name: character.name as string,
@@ -191,9 +195,17 @@ export function buildSoloPveAiEncounter(params: {
     activeTtlSeconds?: number;
     /** Open-world encounter: seed from current vitals and settle them back. */
     continuousVitals?: boolean;
+    /** Consensual spar: settlement writes no HP change and never hospitalizes. */
+    spar?: boolean;
     encounter?: SoloPveEncounter;
     environment?: Partial<SoloPveEnvironment>;
     env?: NodeJS.ProcessEnv;
+    /**
+     * Opt this STANDARD-PvE encounter into the bracket-scaled turn planner.
+     * Only missions, story bosses, the academy spar and generic / world AI
+     * fights pass it; DISABLE_PVE_AI_PLANNER=1 seals nothing.
+     */
+    aiTurnPolicy?: typeof STANDARD_PVE_AI_POLICY;
 }): SoloPveSession {
     const saveCharacter = params.save.character && typeof params.save.character === 'object'
         ? params.save.character as Record<string, unknown>
@@ -218,23 +230,27 @@ export function buildSoloPveAiEncounter(params: {
         params.save,
         params.admin,
     );
-    const enemy = buildEnemy(profile, params.admin, banded);
+    const planner = params.aiTurnPolicy && !standardPveAiPlannerDisabled(params.env ?? process.env) ? params.aiTurnPolicy : undefined;
+    const enemy = buildEnemy(profile, params.admin, banded, planner);
     const continuous = params.continuousVitals === true;
+    // The continuity and spar flags ride on the ENCOUNTER, so settlement can
+    // read them back out of a stored session without a schema change or a
+    // second source of truth. `kind` alone cannot carry them: ai-fight-start
+    // stamps 'generic-ai' for an explore ambush, a hunt, a practice spar AND a
+    // dungeon fight, which do not all share the rules.
+    const flags: Record<string, boolean> = {
+        ...(continuous ? { continuousVitals: true } : {}),
+        ...(params.spar === true ? { spar: true } : {}),
+    };
+    const encounter: SoloPveEncounter = params.encounter
+        ? { ...params.encounter, level: Number(enemy.character.level) || params.encounter.level }
+        : { kind: 'generic-ai', id: profile.id, sourceId: params.profile.id, level: Number(enemy.character.level) || 1 };
     return createSoloPveSession({
         sessionId: params.sessionId,
         ownerSlug: params.playerName,
-        // The continuity flag rides on the ENCOUNTER, so settlement can read it
-        // back out of a stored session without a schema change or a second
-        // source of truth. `kind` alone cannot carry it: ai-fight-start stamps
-        // 'generic-ai' for an explore ambush, a hunt, a practice spar AND a
-        // dungeon fight, which do not all share the rule.
-        encounter: continuous
-            ? (params.encounter
-                ? { ...params.encounter, level: Number(enemy.character.level) || params.encounter.level, metadata: { ...(params.encounter.metadata ?? {}), continuousVitals: true } }
-                : { kind: 'generic-ai', id: profile.id, sourceId: params.profile.id, level: Number(enemy.character.level) || 1, metadata: { continuousVitals: true } })
-            : (params.encounter
-                ? { ...params.encounter, level: Number(enemy.character.level) || params.encounter.level }
-                : { kind: 'generic-ai', id: profile.id, sourceId: params.profile.id, level: Number(enemy.character.level) || 1 }),
+        encounter: Object.keys(flags).length > 0
+            ? { ...encounter, metadata: { ...(encounter.metadata ?? {}), ...flags } }
+            : encounter,
         player: fighterFromHydratedCharacter(hydrated, 62, continuous),
         enemy,
         now: params.now,

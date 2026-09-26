@@ -12,6 +12,7 @@ import { loadAdminCombatContent } from '../_admin-content.js';
 import { augmentSaveWithForgedDefs } from '../_forged-item-registry.js';
 import { loadAiFightProfile } from './_ai-fight-encounter.js';
 import { buildSoloPveAiEncounter } from '../solo-pve/_ai-encounter.js';
+import { STANDARD_PVE_AI_POLICY } from '../solo-pve/_ai-turn-policy.js';
 import { readSoloPveSession, soloPveSessionKey, writeSoloPveSession } from '../solo-pve/_store.js';
 import { isSoloPveSessionLapsed } from '../solo-pve/_session.js';
 import { reconcileLapsedBattle } from '../_battle-lapse.js';
@@ -239,7 +240,15 @@ async function sealAiFightEncounter(
             // fights keep their fresh pool.
             continuousVitals: openWorldContinuousVitalsEnabled()
                 && isOpenWorldBattleKind(worldSpec ? 'world' : (genericAuthority?.battleKind ?? body.battleKind)),
+            // A practice bout is a spar: it never sends anyone to the hospital
+            // and leaves HP as it found it (api/missions/_ai-fight-outcome.ts).
+            // Sealed on the session so every settlement path reads the same
+            // answer — the report, the lapse reconciler and an abandon.
+            spar: !worldSpec && genericAuthority?.battleKind === 'practice',
             admin: await loadAdminCombatContent(),
+            // Standard PvE (generic and world AI fights): the bracket-scaled
+            // turn planner (api/solo-pve/_ai-turn-policy.ts).
+            aiTurnPolicy: STANDARD_PVE_AI_POLICY,
         });
         await writeSoloPveSession(session);
         return { sessionId, session };
@@ -387,6 +396,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                     return noContentRecoveryProbe
                         ? { status: 204, body: { error: 'No active World encounter.' } }
                         : { status: 404, body: { error: 'No active World encounter.' } };
+                }
+                // A hospitalized character starts no NEW World fight either, the
+                // same refusal as the generic branch below. Everything above is a
+                // resume or a read, so a fight already sealed still finishes. This
+                // branch seals open-world fights from the save's CURRENT vitals,
+                // so without this an admitted player would enter one at 0 HP.
+                if (isIncapacitated(character)) {
+                    return { status: 409, body: { error: 'You are in the hospital. Recover before starting a fight.', reason: 'hospitalized' } };
                 }
                 if (worldRequest && pendingChain) {
                     if (!sameWorldAiFightRequest(worldRequest, pendingChain.request)) {
